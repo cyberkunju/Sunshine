@@ -54,13 +54,14 @@ the encoder.
 ```
 encoder = software
 capture = x11
-sw_preset = ultrafast      # lowest encode latency; ~300fps headroom at 1080p60
+sw_preset = superfast      # 3.1x encode headroom at 1080p60; ~20-25% better compression than ultrafast
 sw_tune = zerolatency
 hevc_mode = 1              # advertise H.264 ONLY
 av1_mode = 1
 min_threads = 4            # use all 4 vCPUs as parallel encode slices
 fec_percentage = 15        # trimmed FEC overhead for constrained uplinks
 system_tray = disabled     # headless box: tray D-Bus call otherwise hangs 25s
+# plus systemd Nice=-10 on the service (drop-in) for scheduling priority on the 4-core box
 ```
 
 ## The one knob that still matters: client bitrate
