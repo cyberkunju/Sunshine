@@ -255,7 +255,9 @@ namespace video {
       av_dict_set_int(&options, "dstw", sws_output_frame->width, 0);
       av_dict_set_int(&options, "dsth", sws_output_frame->height, 0);
       av_dict_set_int(&options, "dst_format", sws_output_frame->format, 0);
-      av_dict_set_int(&options, "sws_flags", SWS_LANCZOS | SWS_ACCURATE_RND, 0);
+      // Sentinel: fast bilinear is far cheaper than Lanczos on a GPU-less box and the
+      // quality difference is imperceptible at video frame rates / typical desktop scaling.
+      av_dict_set_int(&options, "sws_flags", SWS_FAST_BILINEAR, 0);
       av_dict_set_int(&options, "threads", config::video.min_threads, 0);
 
       auto status = av_opt_set_dict(sws.get(), &options);
@@ -946,6 +948,16 @@ namespace video {
       {
         {"preset"s, &config::video.sw.sw_preset},
         {"tune"s, &config::video.sw.sw_tune},
+        // Sentinel low-latency mod (GPU-less x264): periodic intra-refresh instead of
+        // full IDR keyframes. Intra blocks are spread across a ~1s wave so the bitrate
+        // stays flat (no keyframe spikes), which removes the periodic micro-stutter on
+        // constrained/WAN links and lowers peak latency toward "native" feel.
+        // scenecut=0 is mandatory with intra-refresh; bframes already 0 via zerolatency.
+        {"x264-params"s, [](const config_t &cfg) {
+           int period = cfg.framerate >= 30 ? cfg.framerate : 30;
+           std::string p = std::to_string(period);
+           return "intra-refresh=1:scenecut=0:keyint=" + p + ":min-keyint=" + p;
+         }},
       },
       {},  // SDR-specific options
       {},  // HDR-specific options
