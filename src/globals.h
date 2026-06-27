@@ -55,6 +55,7 @@ namespace mail {
   MAIL(invalidate_ref_frames);
   MAIL(gamepad_feedback);
   MAIL(hdr);
+  MAIL(adjust_bitrate);  // Sentinel: server-side adaptive bitrate target (int kbps)
 #undef MAIL
 
 }  // namespace mail

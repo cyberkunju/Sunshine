@@ -74,3 +74,50 @@ smoothness on a weak link.
 See `packaging/sentinel/build-fedora.sh` — builds with gcc14 (Sunshine's
 expected toolchain), `-march=native` for Sapphire Rapids, CUDA disabled, into an
 isolated prefix so the stock binary remains an instant rollback.
+
+
+## Server-side Adaptive Bitrate (Sentinel)
+
+Stock Sunshine streams at a **fixed** bitrate — Moonlight's own dynamic-bitrate code was
+deliberately disabled by upstream (`SdpGenerator.c`: *"we don't support dynamic bitrate scaling
+properly ... so we'll just latch the bitrate"*). This fork adds a proper server-side adaptive
+bitrate controller that **works with stock, unmodified Moonlight clients**.
+
+### How it works (no client changes needed)
+- Stock Moonlight already reports network trouble to the host over the ENet control channel:
+  reference-frame-invalidation, IDR requests, and (older clients) loss-stats. Sunshine already
+  receives all of these.
+- These are accumulated as a loss signal (`abr_loss_count`) on the `controlBroadcast` thread.
+- A loss-reactive **AIMD** controller evaluates once per second:
+  - **loss seen →** target × 0.85 (multiplicative decrease), floored at `min_bitrate`.
+  - **clean for ≥3 s →** target += max(500 kbps, ceiling/12) (additive increase), capped at the
+    client-requested bitrate (or `max_bitrate` if lower).
+- The new target is delivered to the encode thread via a `mail::adjust_bitrate` event.
+
+### Live reconfiguration (no keyframe)
+FFmpeg's `libx264` wrapper (`reconfig_encoder()`) already watches `bit_rate` / `rc_max_rate` /
+`rc_buffer_size` on the `AVCodecContext` and calls `x264_encoder_reconfig()` on the next frame —
+**no IDR/keyframe required**. The controller just updates those three fields (preserving the exact
+`rc_buffer_size:bit_rate` ratio Sunshine configured for the slice/fps/format low-latency sizing).
+
+### Config (`sunshine.conf`)
+```
+adaptive_bitrate = enabled   # default disabled; opt-in
+min_bitrate = 3000           # kbps floor; ceiling is the client-requested bitrate
+```
+
+### Files touched
+- `src/globals.h` — `mail::adjust_bitrate` event id.
+- `src/config.{h,cpp}` — `adaptive_bitrate` (bool), `min_bitrate` (int) + defaults/parse.
+- `src/video.h` — `encode_session_t::adjust_bitrate(int kbps)` virtual (default no-op).
+- `src/video.cpp` — `avcodec_encode_session_t::adjust_bitrate()` (live reconfig, ratio-preserving)
+  + consumes the event in the parallel-encoding `encode_run` loop.
+- `src/stream.cpp` — loss-signal accumulation in the control handlers + the AIMD tick in the
+  `controlBroadcast` per-session loop + per-session controller state.
+
+### Notes / tuning
+- This is **loss-reactive** (reacts after unrecoverable loss), like TCP. It is not delay-based
+  (WebRTC GCC), which would need client cooperation. The AIMD constants (0.85 decrease,
+  ceiling/12 increase, 3 s clean window, 1 Hz tick) are damped to avoid the oscillation upstream
+  hit; tune in `stream.cpp` if needed.
+- Gated behind `adaptive_bitrate`; disable to fall back to the exact fixed-bitrate behavior.

@@ -368,6 +368,17 @@ namespace stream {
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
 
+      // Sentinel: server-side adaptive bitrate. The event carries a new target (kbps)
+      // to the encode thread. The controller state below is only ever touched on the
+      // controlBroadcast thread (same thread as the loss/IDR/invalidate handlers), so
+      // no synchronization is needed.
+      safe::mail_raw_t::event_t<int> bitrate_events;
+      int abr_target_kbps = 0;
+      int abr_ceiling_kbps = 0;
+      int abr_clean_ticks = 0;
+      int abr_loss_count = 0;
+      std::chrono::steady_clock::time_point abr_last_tick {};
+
       std::unique_ptr<platf::deinit_t> qos;
     } video;
 
@@ -939,6 +950,11 @@ namespace stream {
 
       auto lastGoodFrame = stats[3];
 
+      // Sentinel ABR: a non-zero loss count is a congestion signal.
+      if (count > 0) {
+        session->video.abr_loss_count += count;
+      }
+
       BOOST_LOG(verbose)
         << "type [IDX_LOSS_STATS]"sv << std::endl
         << "---begin stats---" << std::endl
@@ -951,6 +967,10 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
+      // Sentinel ABR: an explicit IDR request means the client lost enough to need a
+      // full refresh — a strong congestion signal.
+      session->video.abr_loss_count += 1;
+
       session->video.idr_events->raise(true);
     });
 
@@ -958,6 +978,9 @@ namespace stream {
       auto frames = (std::int64_t *) payload.data();
       auto firstFrame = frames[0];
       auto lastFrame = frames[1];
+
+      // Sentinel ABR: reference-frame invalidation is sent on packet loss.
+      session->video.abr_loss_count += 1;
 
       BOOST_LOG(debug)
         << "type [IDX_INVALIDATE_REF_FRAMES]"sv << std::endl
@@ -1124,6 +1147,32 @@ namespace stream {
               auto hdr_info = hdr_queue->pop();
 
               send_hdr_mode(session, std::move(hdr_info));
+            }
+
+            // Sentinel: server-side adaptive bitrate (loss-reactive AIMD), evaluated ~1 Hz.
+            // Loss signals (invalidate-ref-frames / IDR-request / loss-stats) accumulate in
+            // abr_loss_count on this same thread. Decrease fast on loss, climb back slowly
+            // when the link is clean, bounded by [min_bitrate, client-requested ceiling].
+            if (config::video.adaptive_bitrate) {
+              auto now = std::chrono::steady_clock::now();
+              if (now - session->video.abr_last_tick >= std::chrono::seconds(1)) {
+                session->video.abr_last_tick = now;
+                auto &v = session->video;
+                int prev = v.abr_target_kbps;
+                if (v.abr_loss_count > 0) {
+                  v.abr_target_kbps = std::max(config::video.min_bitrate, (v.abr_target_kbps * 17) / 20);  // x0.85
+                  v.abr_clean_ticks = 0;
+                } else if (++v.abr_clean_ticks >= 3) {
+                  int step = std::max(500, v.abr_ceiling_kbps / 12);
+                  v.abr_target_kbps = std::min(v.abr_ceiling_kbps, v.abr_target_kbps + step);
+                  v.abr_clean_ticks = 2;  // keep climbing on subsequent clean ticks
+                }
+                v.abr_loss_count = 0;
+                if (v.abr_target_kbps != prev && v.bitrate_events) {
+                  v.bitrate_events->raise(v.abr_target_kbps);
+                  BOOST_LOG(info) << "ABR: bitrate "sv << prev << " -> "sv << v.abr_target_kbps << " kbps"sv;
+                }
+              }
             }
           }
 
@@ -2023,6 +2072,17 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.bitrate_events = mail->event<int>(mail::adjust_bitrate);
+      {
+        // Sentinel adaptive-bitrate controller initial state.
+        int requested = config.monitor.bitrate;
+        int ceiling = (config::video.max_bitrate > 0) ? std::min(requested, config::video.max_bitrate) : requested;
+        session->video.abr_ceiling_kbps = ceiling;
+        session->video.abr_target_kbps = ceiling;
+        session->video.abr_clean_ticks = 0;
+        session->video.abr_loss_count = 0;
+        session->video.abr_last_tick = std::chrono::steady_clock::now();
+      }
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

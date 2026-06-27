@@ -154,6 +154,10 @@ namespace config {
 
     int max_bitrate;  // Maximum bitrate, sets ceiling in kbps for bitrate requested from client
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
+
+    // Sentinel: server-side adaptive bitrate (works with stock Moonlight via loss feedback)
+    bool adaptive_bitrate;  ///< Enable loss-reactive AIMD bitrate control during a session.
+    int min_bitrate;  ///< Floor (kbps) the controller will not drop below.
   };
 
   struct audio_t {

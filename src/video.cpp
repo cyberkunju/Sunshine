@@ -372,6 +372,27 @@ namespace video {
       request_idr_frame();
     }
 
+    // Sentinel: live bitrate change. FFmpeg's libx264 wrapper (reconfig_encoder)
+    // picks up changes to bit_rate / rc_max_rate / rc_buffer_size on the next frame
+    // and calls x264_encoder_reconfig() — no IDR/keyframe required. We preserve the
+    // exact rc_buffer_size:bit_rate ratio Sunshine configured at init (which already
+    // encodes the slices/fps/HEVC low-latency sizing).
+    void adjust_bitrate(int bitrate_kbps) override {
+      if (!avcodec_ctx || bitrate_kbps <= 0) {
+        return;
+      }
+      if (abr_buf_ratio <= 0.0 && avcodec_ctx->bit_rate > 0) {
+        abr_buf_ratio = (double) avcodec_ctx->rc_buffer_size / (double) avcodec_ctx->bit_rate;
+      }
+      int64_t br = (int64_t) bitrate_kbps * 1000;
+      avcodec_ctx->bit_rate = br;
+      avcodec_ctx->rc_max_rate = br;
+      avcodec_ctx->rc_min_rate = br;
+      if (abr_buf_ratio > 0.0) {
+        avcodec_ctx->rc_buffer_size = (int) (br * abr_buf_ratio);
+      }
+    }
+
     avcodec_ctx_t avcodec_ctx;
     std::unique_ptr<platf::avcodec_encode_device_t> device;
 
@@ -379,6 +400,9 @@ namespace video {
 
     cbs::nal_t sps;
     cbs::nal_t vps;
+
+    // Sentinel: cached rc_buffer_size:bit_rate ratio for live bitrate reconfig.
+    double abr_buf_ratio = -1.0;
 
     // inject sps/vps data into idr pictures
     int inject;
@@ -2069,6 +2093,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto adjust_bitrate_events = mail->event<int>(mail::adjust_bitrate);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2094,6 +2119,13 @@ namespace video {
       }
 
       bool requested_idr_frame = false;
+
+      // Sentinel: apply any pending adaptive-bitrate target before encoding the next frame.
+      while (adjust_bitrate_events->peek()) {
+        if (auto kbps = adjust_bitrate_events->pop(0ms)) {
+          session->adjust_bitrate(*kbps);
+        }
+      }
 
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {
