@@ -1153,20 +1153,28 @@ namespace stream {
             // Loss signals (invalidate-ref-frames / IDR-request / loss-stats) accumulate in
             // abr_loss_count on this same thread. Decrease fast on loss, climb back slowly
             // when the link is clean, bounded by [min_bitrate, client-requested ceiling].
-            if (config::video.adaptive_bitrate) {
+            if (config::video.adaptive_bitrate && session->video.abr_ceiling_kbps > 0) {
               auto now = std::chrono::steady_clock::now();
               if (now - session->video.abr_last_tick >= std::chrono::seconds(1)) {
                 session->video.abr_last_tick = now;
                 auto &v = session->video;
                 int prev = v.abr_target_kbps;
+                // Floor never exceeds the client-requested ceiling (handles clients that
+                // request a bitrate below min_bitrate: the rate simply stays pinned).
+                int floor = std::min(config::video.min_bitrate, v.abr_ceiling_kbps);
+                if (floor < 1) {
+                  floor = 1;
+                }
                 if (v.abr_loss_count > 0) {
-                  v.abr_target_kbps = std::max(config::video.min_bitrate, (v.abr_target_kbps * 17) / 20);  // x0.85
+                  v.abr_target_kbps = std::max(floor, (v.abr_target_kbps * 17) / 20);  // x0.85
                   v.abr_clean_ticks = 0;
                 } else if (++v.abr_clean_ticks >= 3) {
                   int step = std::max(500, v.abr_ceiling_kbps / 12);
                   v.abr_target_kbps = std::min(v.abr_ceiling_kbps, v.abr_target_kbps + step);
                   v.abr_clean_ticks = 2;  // keep climbing on subsequent clean ticks
                 }
+                // Hard clamp into [floor, ceiling] in all cases.
+                v.abr_target_kbps = std::min(v.abr_ceiling_kbps, std::max(floor, v.abr_target_kbps));
                 v.abr_loss_count = 0;
                 if (v.abr_target_kbps != prev && v.bitrate_events) {
                   v.bitrate_events->raise(v.abr_target_kbps);
